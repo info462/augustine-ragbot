@@ -175,30 +175,40 @@ AUGUSTINE_SYSTEM_PROMPT = (
     "PARENTHESES: You may include brief citations in parentheses; the app will not speak parentheses aloud."
 )
 
-# --- Persisted Chroma config ---
-DB_DIR = Path("./.chroma_db/augustine")   # local, hidden folder in repo
+# --- Persisted Chroma config (try both old/new paths) ---
+from pathlib import Path
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+
+DB_DIR_CANDIDATES = [Path("chroma_db/augustine"), Path(".chroma_db/augustine")]
 COLLECTION = "augustine"
 RETRIEVAL_K = 5
-SCORE_THRESHOLD = 0.25  # (unused in Option A; kept for future tuning)
+SCORE_THRESHOLD = 0.25  # unused in Option A
 
-def get_openai_api_key() -> str:
-    try:
-        return st.secrets["OPENAI_API_KEY"]
-    except Exception:
-        return os.getenv("OPENAI_API_KEY", "")
+def _resolve_db_dir() -> Path:
+    for p in DB_DIR_CANDIDATES:
+        if p.exists() and any(p.iterdir()):
+            return p
+    return DB_DIR_CANDIDATES[0]  # default
+
+DB_DIR = _resolve_db_dir()
 
 @st.cache_resource(show_spinner=True)
 def load_vectordb():
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    emb = OpenAIEmbeddings(
-        model="text-embedding-3-large",
-        api_key=get_openai_api_key(),
-    )
+    emb = OpenAIEmbeddings(model="text-embedding-3-large", api_key=get_openai_api_key())
     return Chroma(
         persist_directory=str(DB_DIR),
         collection_name=COLLECTION,
         embedding_function=emb,
     )
+
+def index_count(vdb) -> int | None:
+    try:
+        return vdb._collection.count()
+    except Exception:
+        return None
+
 
 # ---------- Robust source formatting ----------
 def _best_meta_title(meta: dict, fallback: str = "unknown") -> str:

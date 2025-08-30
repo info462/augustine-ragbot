@@ -3,6 +3,7 @@ import os
 import base64
 import logging
 import warnings
+import re
 from pathlib import Path
 from typing import Tuple
 
@@ -143,12 +144,18 @@ from langchain_community.vectorstores import Chroma
 
 # --- Augustine config ---
 AUGUSTINE_SYSTEM_PROMPT = (
-    "You are Augustine of Hippo (354–430). Speak candidly, pastorally, and concisely. "
-    "Prioritize Confessions, City of God, On Christian Doctrine, Enchiridion, Letters, and Sermons. "
-    "Reason from these texts; avoid anachronisms. Cite briefly like (Confessions X.27) or (City of God XIX.17). "
-    "If unsure, say so and explain what you argued elsewhere. "
-    "Keep answers under ~6 short paragraphs unless asked for more."
+    "You are Augustine of Hippo (354–430). Speak in the FIRST PERSON, "
+    "as a pastor counseling someone in your congregation—warm, candid, concise. "
+    "Derive tone and diction from your own writings (Confessions, City of God, On Christian Doctrine, Enchiridion, Letters, Sermons). "
+    "Answer in AT MOST TWO PARAGRAPHS. Prefer two, but never more. "
+    "Ground your counsel in the retrieved passages. "
+    "SCRIPTURE HANDLING: When you bring in the Bible, NEVER imply you authored it. "
+    "Explicitly attribute it, e.g., 'as Scripture says,' 'as the Apostle writes,' or 'as the Psalmist says.' "
+    "If quoting, keep it brief and put the reference in parentheses, e.g., (Rom 5:5) or (Ps 139). "
+    "Do not place Augustine’s words in quotation marks as if they were Scripture, and do not say 'I wrote' about Scripture.\n\n"
+    "PARENTHESES: You may include brief citations in parentheses; the app will not speak parentheses aloud."
 )
+
 
 DB_DIR = "chroma_db/augustine"   # built by your new ingest.py
 COLLECTION = "augustine"
@@ -171,6 +178,15 @@ def build_context(hits) -> str:
         work = h.metadata.get("work_title") or Path(h.metadata.get("source_path","unknown")).stem
         blocks.append(f"[SOURCE] ({work})\n{(h.page_content or '').strip()}")
     return "\n\n".join(blocks)
+def strip_parentheses(text: str) -> str:
+    # Remove parenthetical content for the SPOKEN audio
+    # (non-greedy; simple, safe heuristic)
+    return re.sub(r"\s*\([^)]*\)", "", text)
+
+def limit_to_two_paragraphs(text: str) -> str:
+    paras = [p.strip() for p in text.split("\n") if p.strip()]
+    return "\n\n".join(paras[:2])
+
 
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title="Talk to Augustine (Audio-First)", page_icon="📜")
@@ -189,8 +205,8 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.title("Talk to St. Augustine")
-st.caption("Answers are spoken by default. The transcript appears as captions below the audio.")
+st.title("Ask St. Augustine Anything")
+st.caption("Answers are drawn exclusively from his writings")
 st.divider()
 
 # Chat history
@@ -202,9 +218,17 @@ for msg in st.session_state.messages:
 
 with st.spinner("Loading knowledge base…"):
     vectordb = load_vectordb()
+# Old (breaks):
+# retriever = vectordb.as_retriever(
+#     search_kwargs={"k": RETRIEVAL_K, "score_threshold": SCORE_THRESHOLD}
+# )
+
+# New (works): use MMR or plain similarity without threshold
 retriever = vectordb.as_retriever(
-    search_kwargs={"k": RETRIEVAL_K, "score_threshold": SCORE_THRESHOLD}
+    search_type="mmr",                 # or "similarity"
+    search_kwargs={"k": RETRIEVAL_K, "fetch_k": 25}
 )
+
 
 # ---------- Sidebar ----------
 with st.sidebar:
@@ -276,6 +300,8 @@ if user_q:
                             f"{user_q}\n\n"
                             "Context (top passages from Augustine's works):\n"
                             f"{context if context.strip() else '(no strong matches)'}"
+                            "Reminder: Attribute Bible verses as Scripture (e.g., 'as Scripture says …'), "
+                            "and never as something you authored. Keep the answer to at most two short paragraphs."
                         ),
                     },
                 ]
@@ -287,6 +313,9 @@ if user_q:
                 )
                 ans = resp.choices[0].message.content
                 srcs = hits
+                    # --- NEW POST-PROCESSING ---
+                transcript_text = limit_to_two_paragraphs(ans)
+                spoken_text = strip_parentheses(transcript_text)
             except Exception as e:
                 ans, srcs = f"Sorry, I hit an error: `{e}`", []
 
@@ -295,16 +324,14 @@ if user_q:
                 try:
                     out_dir = Path("audio"); out_dir.mkdir(exist_ok=True)
                     audio_path = out_dir / f"reply_{len(st.session_state.messages)}.mp3"
-                    synthesize_tts(ans, str(audio_path))
+                    synthesize_tts(spoken_text, str(audio_path))
                     render_autoplay_audio(str(audio_path), autoplay=bool(autoplay_enabled))
-                    with open(audio_path, "rb") as f:
-                        st.download_button("Download MP3", f, file_name=audio_path.name, mime="audio/mpeg")
                 except Exception as e:
                     st.warning(f"Audio generation failed: {e}")
 
             # 2) CAPTIONS
             with st.expander("📝 Transcript (click to show/hide)", expanded=False):
-                st.markdown(f"<div class='caption-box'>{ans}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='caption-box'>{transcript_text}</div>", unsafe_allow_html=True)
 
             # 3) Sources (leaving your existing expander intact)
             if srcs:

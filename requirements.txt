@@ -19,4 +19,4 @@ pypdf>=4.2.0
 elevenlabs>=2.11.0
 
 # Rare SQLite fix: if you hit a “SQLite compiled without JSON1” error on deploy, add this
-# pysqlite3-binary==0.5.3.post3
+pysqlite3-binary==0.5.3.post3

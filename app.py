@@ -268,6 +268,10 @@ st.divider()
 # Chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
+# NEW: persist last hits for showing Sources even across reruns
+if "last_hits" not in st.session_state:
+    st.session_state.last_hits = []
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -330,7 +334,6 @@ if user_q:
     ans = ""
     transcript_text = ""
     spoken_text = ""
-    hits = []
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
@@ -339,6 +342,7 @@ if user_q:
                 hits = vectordb.similarity_search_with_relevance_scores(
                     user_q, k=RETRIEVAL_K
                 )
+                st.session_state.last_hits = hits  # <-- persist for the Sources section
                 context = build_context(hits)
 
                 messages = [
@@ -369,7 +373,7 @@ if user_q:
 
             except Exception as e:
                 ans = f"Sorry, I hit an error: `{e}`"
-                hits = []
+                st.session_state.last_hits = []  # make it explicit on failure
 
             # 1) AUDIO FIRST
             if audio_enabled and ELEVEN_API_KEY and ans.strip():
@@ -388,35 +392,41 @@ if user_q:
                     unsafe_allow_html=True
                 )
 
-            # 3) Sources (robust render + score)
-            if hits:
-                with st.expander("Sources (click to expand)"):
-                    for i, h in enumerate(hits, 1):
-                        if isinstance(h, tuple):
-                            d, sc = h
-                        else:
-                            d, sc = h, None
-                        meta = d.metadata or {}
-                        work = _best_meta_title(meta, fallback=Path(meta.get("source_path","unknown")).stem)
-                        page = _best_meta_page(meta)
-                        line = f"**{i}. {work}** — {page}"
-                        if sc is not None:
-                            try:
-                                line += f"  _(score: {sc:.3f})_"
-                            except Exception:
-                                pass
-                        st.markdown(line)
+# ---------- ALWAYS render Sources + Debug (persists across reruns) ----------
+with st.expander("Sources (click to expand)", expanded=False):
+    hits_to_show = st.session_state.get("last_hits", [])
+    if not hits_to_show:
+        st.caption("No sources retrieved. (Index empty or no strong matches.)")
+        st.caption("Tip: click “🔁 Rebuild index” in the sidebar if you haven’t ingested yet.")
+    else:
+        for i, h in enumerate(hits_to_show, 1):
+            if isinstance(h, tuple):
+                d, sc = h
+            else:
+                d, sc = h, None
+            meta = d.metadata or {}
+            work = _best_meta_title(meta, fallback=Path(meta.get("source_path","unknown")).stem)
+            page = _best_meta_page(meta)
+            line = f"**{i}. {work}** — {page}"
+            if sc is not None:
+                try:
+                    line += f"  _(score: {sc:.3f})_"
+                except Exception:
+                    pass
+            st.markdown(line)
 
-                        excerpt = (d.page_content or "").strip().replace("\n", " ")
-                        if excerpt:
-                            st.caption(excerpt[:350] + ("…" if len(excerpt) > 350 else ""))
+            excerpt = (d.page_content or "").strip().replace("\n", " ")
+            if excerpt:
+                st.caption(excerpt[:350] + ("…" if len(excerpt) > 350 else ""))
 
-                # Optional debug: raw metadata keys
-                with st.expander("🔧 Debug: raw metadata"):
-                    try:
-                        meta_list = [ (h[0].metadata if isinstance(h, tuple) else h.metadata) for h in hits ]
-                        st.json(meta_list)
-                    except Exception:
-                        st.caption("Could not display raw metadata.")
+with st.expander("🔧 Debug: raw metadata"):
+    try:
+        meta_list = [ (h[0].metadata if isinstance(h, tuple) else h.metadata)
+                      for h in st.session_state.get("last_hits", []) ]
+        st.json(meta_list)
+    except Exception:
+        st.caption("Could not display raw metadata.")
 
-    st.session_state.messages.append({"role": "assistant", "content": ans})
+# Finally, if we generated an answer this run, store it in history
+if user_q:
+    st.session_state.messages.append({"role": "assistant", "content": (transcript_text or ans)})

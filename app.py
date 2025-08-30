@@ -294,19 +294,19 @@ with st.sidebar:
     st.subheader("Dataset")
     st.write("Chroma index loaded from ./.chroma_db/augustine.")
     st.caption("Source files (cleaned) live under `data/clean_final`. Use the button below to rebuild the index.")
-
+   
     # Optional: rebuild button
     try:
-       from ingest import rebuild_vectorstore
-
-if st.button("🔁 Rebuild index from data/clean_final"):
-    import os
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # <-- bridge secrets → env
-    with st.spinner("Rebuilding vector store…"):
-        rebuild_vectorstore()
-    st.success("Done. Reload the page to use the new index.")
+        from ingest import rebuild_vectorstore
+        if st.button("🔁 Rebuild index from data/clean_final"):
+            import os
+            os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # <-- bridge secrets → env
+            with st.spinner("Rebuilding vector store…"):
+                rebuild_vectorstore()
+            st.success("Done. Reload the page to use the new index.")
     except Exception:
         st.caption("`ingest.py` not found, rebuild button disabled.")
+
 
     st.subheader("Audio")
     ok, reason = eleven_preflight()

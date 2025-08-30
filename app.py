@@ -298,12 +298,14 @@ with st.sidebar:
     # Optional: rebuild button
     try:
        from ingest import rebuild_vectorstore
-        if st.button("🔁 Rebuild index from data/clean_final"):
-        import os
-        os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # <-- bridge secrets → env
-        with st.spinner("Rebuilding vector store…"):
-            rebuild_vectorstore()
-        st.success("Done. Reload the page to use the new index.")
+
+if st.button("🔁 Rebuild index from data/clean_final"):
+    import os
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # <-- bridge secrets → env
+    with st.spinner("Rebuilding vector store…"):
+        rebuild_vectorstore()
+    st.success("Done. Reload the page to use the new index.")
+
 
     except Exception:
         st.caption("`ingest.py` not found, rebuild button disabled.")

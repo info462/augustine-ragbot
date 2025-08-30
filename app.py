@@ -305,8 +305,6 @@ if st.button("🔁 Rebuild index from data/clean_final"):
     with st.spinner("Rebuilding vector store…"):
         rebuild_vectorstore()
     st.success("Done. Reload the page to use the new index.")
-
-
     except Exception:
         st.caption("`ingest.py` not found, rebuild button disabled.")
 

@@ -179,10 +179,6 @@ AUGUSTINE_SYSTEM_PROMPT = (
 )
 
 # --- Persisted Chroma config (try both old/new paths) ---
-from pathlib import Path
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
-
 DB_DIR_CANDIDATES = [Path("chroma_db/augustine"), Path(".chroma_db/augustine")]
 COLLECTION = "augustine"
 RETRIEVAL_K = 5
@@ -192,30 +188,26 @@ def _resolve_db_dir() -> Path:
     for p in DB_DIR_CANDIDATES:
         if p.exists() and any(p.iterdir()):
             return p
-    return DB_DIR_CANDIDATES[0]  # default
+    return DB_DIR_CANDIDATES[0]  # default/fallback
 
 DB_DIR = _resolve_db_dir()
 
 @st.cache_resource(show_spinner=True)
 def load_vectordb():
     DB_DIR.mkdir(parents=True, exist_ok=True)
-
-    emb = OpenAIEmbeddings(
-        model="text-embedding-3-large"   # <-- remove api_key=...
-    )
-
+    emb = OpenAIEmbeddings(model="text-embedding-3-large")
     return Chroma(
         persist_directory=str(DB_DIR),
         collection_name=COLLECTION,
         embedding_function=emb,
     )
 
-
 def index_count(vdb) -> int | None:
     try:
         return vdb._collection.count()
     except Exception:
         return None
+
 
 
 # ---------- Robust source formatting ----------
@@ -300,9 +292,23 @@ with st.spinner("Loading knowledge base…"):
 # ---------- Sidebar ----------
 with st.sidebar:
     st.subheader("Dataset")
+    st.caption(f"📂 Index path: `{DB_DIR}`")
+    st.caption(f"🧩 Chunks in index: **{index_count(vectordb)}**")
     st.write("Chroma index loaded from ./.chroma_db/augustine.")
     st.caption("Source files (cleaned) live under `data/clean_final`. Use the button below to rebuild the index.")
    
+test_q = st.text_input("🔎 Test query (debug)", value="grace and will")
+if st.button("Run test retrieval"):
+    try:
+        test_hits = vectordb.similarity_search_with_relevance_scores(test_q, k=3)
+        st.session_state.last_hits = test_hits  # so the main expander shows them
+        st.success(f"Retrieved {len(test_hits)} chunk(s). See Sources expander.")
+        # Show raw metadata immediately here too
+        st.write("Raw metadata:")
+        st.json([ (h[0].metadata if isinstance(h, tuple) else h.metadata) for h in test_hits ])
+    except Exception as e:
+        st.error(f"Test retrieval error: {e}")
+
     # Optional: rebuild button
     try:
         from ingest import rebuild_vectorstore

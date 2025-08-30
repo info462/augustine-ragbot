@@ -67,6 +67,9 @@ except Exception:
 if not OPENAI_API_KEY:
     st.error("❌ Missing OPENAI_API_KEY. Add to `.streamlit/secrets.toml` or Streamlit Cloud → Settings → Secrets.")
     st.stop()
+# Make sure downstream libs see the key via env
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+
 
 # ---------- OpenAI client ----------
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -196,12 +199,17 @@ DB_DIR = _resolve_db_dir()
 @st.cache_resource(show_spinner=True)
 def load_vectordb():
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    emb = OpenAIEmbeddings(model="text-embedding-3-large", api_key=get_openai_api_key())
+
+    emb = OpenAIEmbeddings(
+        model="text-embedding-3-large"   # <-- remove api_key=...
+    )
+
     return Chroma(
         persist_directory=str(DB_DIR),
         collection_name=COLLECTION,
         embedding_function=emb,
     )
+
 
 def index_count(vdb) -> int | None:
     try:

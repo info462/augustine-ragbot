@@ -138,75 +138,42 @@ def synthesize_tts(text: str, out_path: str) -> str:
     raise RuntimeError(f"ElevenLabs TTS failed. Primary: {reason}. Fallback: {reason_fb}")
 
 # ---------- LangChain bits (READ-ONLY vector DB) ----------
-from collections import Counter
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 
-DB_DIR = "chroma_db"
-COLLECTION = "cslewis"
+# --- Augustine config ---
+AUGUSTINE_SYSTEM_PROMPT = (
+    "You are Augustine of Hippo (354–430). Speak candidly, pastorally, and concisely. "
+    "Prioritize Confessions, City of God, On Christian Doctrine, Enchiridion, Letters, and Sermons. "
+    "Reason from these texts; avoid anachronisms. Cite briefly like (Confessions X.27) or (City of God XIX.17). "
+    "If unsure, say so and explain what you argued elsewhere. "
+    "Keep answers under ~6 short paragraphs unless asked for more."
+)
+
+DB_DIR = "chroma_db/augustine"   # built by your new ingest.py
+COLLECTION = "augustine"
+
+RETRIEVAL_K = 5
+SCORE_THRESHOLD = 0.25
 
 @st.cache_resource
 def load_vectordb():
-    emb = OpenAIEmbeddings(model="text-embedding-3-small")
-    return Chroma(persist_directory=DB_DIR,
-                  collection_name=COLLECTION,
-                  embedding_function=emb)
-
-def genre_of_hits(hits) -> str:
-    genres = [d.metadata.get("genre", "unknown") for d in hits]
-    return Counter(genres).most_common(1)[0][0] if genres else "unknown"
-
-def make_system_prompt(genre: str) -> str:
-    # FIRST-PERSON persona
-    base = (
-        "You are C. S. Lewis. Always write in the first person—as if these are my own words and as if you were in conversation with a friend or student. "
-        "Derive tone, cadence, and imagery from the retrieved excerpts themselves—"
-        "balanced sentences, vivid analogies, moral clarity, and plain yet luminous diction. "
-        "Do NOT invent sources. If you cannot answer from the excerpts, say so.\n\n"
-        "Keep answers to 2-3 paragraphs maximum."
-        "Quoting rules: Do not quote more than ~50 consecutive words from any source. "
-        'Prefer paraphrase in my style over long quotation.'
+    emb = OpenAIEmbeddings(model="text-embedding-3-large", api_key=OPENAI_API_KEY)
+    return Chroma(
+        persist_directory=DB_DIR,
+        collection_name=COLLECTION,
+        embedding_function=emb
     )
-
-    if genre == "fiction":
-        rule = (
-            "\n\nFiction rule: The sources are my fictional works. "
-            "Do NOT role-play as my characters. Speak only as myself, the author, in the first person, "
-            "reflecting on the themes and meaning of the story."
-        )
-    elif genre == "nonfiction":
-        rule = (
-            "\n\nNonfiction rule: Write directly in my expository, reflective voice, "
-            "as if speaking with a friend or student."
-        )
-    elif genre == "poetry":
-        rule = (
-            "\n\nPoetry rule: These are poems I have written. Interpret and comment in my voice. "
-            "If asked to compose poetry, create original lines in my diction and rhythm, "
-            "but keep them clearly new—not reproductions of the originals."
-        )
-    else:
-        rule = (
-            "\n\nUnknown-genre: Speak in my first-person authorial voice; never as characters."
-        )
-
-    style_tips = (
-        "\n\nStyle guide to emulate: "
-        "• concrete images that serve argument • contrast and antithesis • plain speech with classical cadence "
-        "• charity in tone but firmness in conclusion • short metaphors rather than extended pastiche."
-    )
-
-    return base + rule + style_tips
 
 def build_context(hits) -> str:
     blocks = []
     for h in hits:
-        cite = f"({h.metadata.get('work_title','unknown')})"
-        blocks.append(f"[SOURCE] {cite}\n{h.page_content}")
+        work = h.metadata.get("work_title") or Path(h.metadata.get("source_path","unknown")).stem
+        blocks.append(f"[SOURCE] ({work})\n{(h.page_content or '').strip()}")
     return "\n\n".join(blocks)
 
 # ---------- Streamlit UI ----------
-st.set_page_config(page_title="Ask C.S. Lewis (Audio-First)", page_icon="📚")
+st.set_page_config(page_title="Talk to Augustine (Audio-First)", page_icon="📜")
 st.markdown(
     """
     <style>
@@ -222,7 +189,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.title("Talk to C.S. Lewis")
+st.title("Talk to St. Augustine")
 st.caption("Answers are spoken by default. The transcript appears as captions below the audio.")
 st.divider()
 
@@ -235,18 +202,20 @@ for msg in st.session_state.messages:
 
 with st.spinner("Loading knowledge base…"):
     vectordb = load_vectordb()
-retriever = vectordb.as_retriever(search_type="mmr", search_kwargs={"k": 6, "fetch_k": 20})
+retriever = vectordb.as_retriever(
+    search_kwargs={"k": RETRIEVAL_K, "score_threshold": SCORE_THRESHOLD}
+)
 
 # ---------- Sidebar ----------
 with st.sidebar:
     st.subheader("Dataset")
-    st.write("Chroma index loaded from /chroma_db.")
-    st.caption("Source files live under `data/` (recursed). Use the button below to rebuild the index.")
+    st.write("Chroma index loaded from /chroma_db/augustine.")
+    st.caption("Source files (cleaned) live under `data/clean_final`. Use the button below to rebuild the index.")
 
     # Optional: rebuild button
     try:
         from ingest import rebuild_vectorstore
-        if st.button("🔁 Rebuild index from /data"):
+        if st.button("🔁 Rebuild index from data/clean_final"):
             with st.spinner("Rebuilding vector store…"):
                 rebuild_vectorstore()
             st.success("Done. Reload the page to use the new index.")
@@ -294,32 +263,21 @@ if user_q:
             try:
                 hits = retriever.get_relevant_documents(user_q)
 
-                # Derive genre and build safe strings
-                genre = genre_of_hits(hits)
-
-                def _safe_system_prompt(g: str) -> str:
-                    try:
-                        s = make_system_prompt(g)
-                        if isinstance(s, str) and s.strip():
-                            return s
-                    except Exception as e:
-                        st.warning(f"make_system_prompt error: {e}")
-                    return (
-                        "You are C. S. Lewis. Write in the first person. "
-                        "Use ONLY the retrieved excerpts; if unsure, say so. "
-                        "Do not role-play fictional characters."
-                    )
-
-                def _safe_str(x) -> str:
-                    return x if isinstance(x, str) else (x or "")
-
-                system_prompt = _safe_system_prompt(genre)
-                context = _safe_str(build_context(hits))
+                # Build system prompt + context
+                system_prompt = AUGUSTINE_SYSTEM_PROMPT
+                context = build_context(hits)
 
                 messages = [
+                    {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_q},
-                    {"role": "system", "content": context},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"{user_q}\n\n"
+                            "Context (top passages from Augustine's works):\n"
+                            f"{context if context.strip() else '(no strong matches)'}"
+                        ),
+                    },
                 ]
 
                 resp = client.chat.completions.create(
@@ -348,7 +306,7 @@ if user_q:
             with st.expander("📝 Transcript (click to show/hide)", expanded=False):
                 st.markdown(f"<div class='caption-box'>{ans}</div>", unsafe_allow_html=True)
 
-            # 3) Sources
+            # 3) Sources (leaving your existing expander intact)
             if srcs:
                 with st.expander("Sources (click to expand)"):
                     for i, d in enumerate(srcs, 1):

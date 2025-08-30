@@ -10,18 +10,22 @@ from pathlib import Path
 from typing import List, Dict
 
 from dotenv import load_dotenv
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
+from langchain.docstore.document import Document
 
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 
-# --------- Config ---------
-DOC_ROOT = Path("data")          # your PDFs (already OCR'd) live here
-DB_DIR = "chroma_db"             # Chroma persistence folder
-COLLECTION = "cslewis"
-ALLOWED_GENRES = {"fiction", "nonfiction", "poetry"}  # case-insensitive
+# --------- Config (Augustine) ---------
+# Use cleaned TEXT files produced by your extraction/cleanup pipeline
+DOC_ROOT = Path("data/clean_final")   # <-- change if you keep your final texts elsewhere
+DB_DIR = "chroma_db/augustine"        # keep separate; safe to change to "chroma_db" if you prefer
+COLLECTION = "augustine"
+
+# Chunking tuned for Augustine's long sentences/paragraphs
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 200
 
 # --------- Env / API key ---------
 load_dotenv()  # read .env if present
@@ -44,14 +48,8 @@ def normalize_text(t: str) -> str:
     """
     if not t:
         return ""
-    # Keep newlines; normalize spaces inside lines
-    lines = [ _ws_collapse.sub(" ", ln).rstrip() for ln in t.splitlines() ]
+    lines = [_ws_collapse.sub(" ", ln).rstrip() for ln in t.splitlines()]
     return "\n".join(lines).strip()
-
-def infer_genre(path: Path) -> str:
-    """Infer genre from the immediate parent folder name (case-insensitive)."""
-    parent = path.parent.name.lower()
-    return parent if parent in ALLOWED_GENRES else "unknown"
 
 def content_hash(text: str, meta: Dict) -> str:
     """
@@ -59,60 +57,56 @@ def content_hash(text: str, meta: Dict) -> str:
     """
     h = hashlib.sha256()
     h.update(text.encode("utf-8", errors="ignore"))
-    h.update(("|" + meta.get("work_title","") + "|" + meta.get("genre","")).encode("utf-8"))
+    h.update(("|" + meta.get("work_title", "") + "|" + meta.get("author", "")).encode("utf-8"))
     return h.hexdigest()[:16]
 
-def load_and_split_docs(root: Path) -> List:
-    """Load PDFs recursively, attach metadata, and split into chunks."""
-    pdf_paths = sorted(root.rglob("*.pdf"))
+def load_and_split_docs(root: Path) -> List[Document]:
+    """
+    Load *.txt files from DOC_ROOT, attach metadata, and split into chunks.
+    """
+    if not root.exists():
+        raise RuntimeError(f"Input folder not found: {root.resolve()}")
+
+    txt_paths = sorted(list(root.rglob("*.txt")))
+    if not txt_paths:
+        raise RuntimeError(f"No .txt files found under {root.resolve()}")
+
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1200,
-        chunk_overlap=150,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
         separators=["\n\n", "\n", " ", ""],
     )
 
-    all_chunks = []
-    loaded_count = 0
-    skipped = []
-    genre_counts = {"fiction": 0, "nonfiction": 0, "poetry": 0, "unknown": 0}
-
-    for pdf in pdf_paths:
-        try:
-            pages = PyPDFLoader(str(pdf)).load()
-            loaded_count += 1
-        except Exception as e:
-            skipped.append(f"{pdf.name}: {e}")
+    all_chunks: List[Document] = []
+    for p in txt_paths:
+        raw = p.read_text(encoding="utf-8", errors="ignore")
+        norm = normalize_text(raw)
+        if not norm:
             continue
 
-        genre = infer_genre(pdf)
-        genre_counts[genre] = genre_counts.get(genre, 0) + 1
-        work_title = pdf.stem
+        # One big document per file; splitting happens next
+        base_meta = {
+            "author": "Augustine of Hippo",
+            "work_title": p.stem,      # e.g., Confessions_Bk10
+            "source_path": str(p),
+        }
+        doc = Document(page_content=norm, metadata=base_meta)
 
-        # enrich page-level metadata + normalize text before splitting
-        for d in pages:
-            d.page_content = normalize_text(d.page_content or "")
-            d.metadata.update(
-                {
-                    "genre": genre,
-                    "author": "C. S. Lewis",
-                    "work_title": work_title,
-                    "source_path": str(pdf),
-                }
-            )
+        chunks = splitter.split_documents([doc])
 
-        chunks = splitter.split_documents(pages)
-
-        # add chunk_id and drop empty chunks
-        kept = []
+        kept: List[Document] = []
         for idx, ch in enumerate(chunks):
             if not ch.page_content.strip():
                 continue
-            ch.metadata["chunk_id"] = f"{work_title}:{idx:05d}"
+            ch.metadata.update({
+                "chunk_id": f"{p.stem}:{idx:05d}"
+            })
             kept.append(ch)
+
         all_chunks.extend(kept)
 
-    # De-duplicate by content hash (common with re-OCR or overlapping pages)
-    deduped = []
+    # De-duplicate by content hash (helps if multiple files overlap)
+    deduped: List[Document] = []
     seen = set()
     for d in all_chunks:
         h = content_hash(d.page_content, d.metadata)
@@ -122,35 +116,28 @@ def load_and_split_docs(root: Path) -> List:
         seen.add(h)
         deduped.append(d)
 
-    print(f"[INGEST] Scanned {len(pdf_paths)} PDFs; loaded {loaded_count}, skipped {len(pdf_paths)-loaded_count}.")
-    if skipped:
-        print("[INGEST] Skipped files:")
-        for s in skipped:
-            print("  -", s)
-
-    print("[INGEST] Per-genre files:", {k: v for k, v in genre_counts.items() if v})
+    print(f"[INGEST] Found {len(txt_paths)} text files under {root}.")
     print(f"[INGEST] Produced {len(all_chunks)} chunks; kept {len(deduped)} unique after de-dup.")
-
     return deduped
 
 def rebuild_vectorstore():
-    """Wipe and rebuild the persistent Chroma index from /data."""
+    """Wipe and rebuild the persistent Chroma index from /data/clean_final."""
     # Hard wipe to avoid stale collections
     if Path(DB_DIR).exists():
         shutil.rmtree(DB_DIR, ignore_errors=True)
 
     docs = load_and_split_docs(DOC_ROOT)
     if not docs:
-        raise RuntimeError("No documents were loaded. Check your /data folder.")
+        raise RuntimeError("No documents were loaded. Check your /data/clean_final folder.")
 
     embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small",   # upgrade to -3-large if you want higher recall
-        api_key=OPENAI_API_KEY,           # important: ingest.py runs outside Streamlit
+        model="text-embedding-3-large",   # match your Lewis bot if you used large; downgrade if needed
+        api_key=OPENAI_API_KEY,           # ingest runs outside Streamlit; pass key explicitly
     )
 
     _ = Chroma.from_documents(
         documents=docs,
-        embedding=embeddings,
+        embedding=embeddings,              # keep same kwarg style as your working setup
         persist_directory=DB_DIR,
         collection_name=COLLECTION,
     )

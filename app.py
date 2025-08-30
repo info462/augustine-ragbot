@@ -19,6 +19,7 @@ from typing import Tuple
 
 import streamlit as st
 from openai import OpenAI
+import requests
 
 # Optional: verify JSON1 at runtime (shows up in Streamlit logs)
 try:
@@ -71,8 +72,6 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------- ElevenLabs preflight ----------
-import requests
-
 def eleven_preflight() -> Tuple[bool, str]:
     if not ELEVEN_API_KEY:
         return False, "Add ELEVEN_API_KEY in secrets to enable audio."
@@ -101,7 +100,7 @@ def eleven_preflight() -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Could not reach ElevenLabs voice endpoint: {e}"
 
-# ---------- TTS helper ----------
+# ---------- TTS helpers ----------
 RACHEL_ID = "21m00Tcm4TlvDq8ikWAM"
 
 def _http_tts(voice_id: str, text: str, out_path: str) -> Tuple[bool, str]:
@@ -128,6 +127,7 @@ def synthesize_tts(text: str, out_path: str) -> str:
     MAX_CHARS = 1800
     speak_text = text if len(text) <= MAX_CHARS else text[:MAX_CHARS] + "…"
 
+    # Try SDK v2 first
     try:
         from elevenlabs.client import ElevenLabs
         el_client = ElevenLabs(api_key=ELEVEN_API_KEY)
@@ -148,6 +148,7 @@ def synthesize_tts(text: str, out_path: str) -> str:
     except Exception as e:
         if ELEVEN_VERBOSE_ERRORS: st.caption(f"SDK v2 import/init failed: {e}")
 
+    # Fallback to raw HTTP; then fallback voice
     ok, reason = _http_tts(ELEVEN_VOICE_ID, speak_text, out_path)
     if ok: return out_path
     ok_fb, reason_fb = _http_tts(RACHEL_ID, speak_text, out_path)
@@ -156,7 +157,7 @@ def synthesize_tts(text: str, out_path: str) -> str:
         return out_path
     raise RuntimeError(f"ElevenLabs TTS failed. Primary: {reason}. Fallback: {reason_fb}")
 
-# ---------- LangChain / Chroma config ----------
+# ---------- LangChain / Chroma ----------
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 
@@ -199,13 +200,41 @@ def load_vectordb():
         embedding_function=emb,
     )
 
+# ---------- Robust source formatting ----------
+def _best_meta_title(meta: dict, fallback: str = "unknown") -> str:
+    return (
+        meta.get("work_title")
+        or meta.get("title")
+        or meta.get("source")
+        or meta.get("source_path")
+        or meta.get("file_path")
+        or meta.get("path")
+        or meta.get("filename")
+        or fallback
+    )
+
+def _best_meta_page(meta: dict):
+    return meta.get("page") or meta.get("page_number") or meta.get("page_no") or "chunk"
+
 def build_context(hits) -> str:
-    """Accepts list[(Document, score)] or list[Document] and formats them."""
+    """Accepts list[(Document, score)] or list[Document]; formats for prompting."""
     blocks = []
     for h in hits:
-        doc = h[0] if isinstance(h, tuple) else h
-        work = doc.metadata.get("work_title") or Path(doc.metadata.get("source_path", "unknown")).stem
-        blocks.append(f"[SOURCE] ({work})\n{(doc.page_content or '').strip()}")
+        if isinstance(h, tuple):
+            doc, score = h
+        else:
+            doc, score = h, None
+        meta = doc.metadata or {}
+        title = _best_meta_title(meta, fallback=Path(meta.get("source_path", "unknown")).stem)
+        page = _best_meta_page(meta)
+        header = f"[SOURCE] ({title} — {page})"
+        if score is not None:
+            try:
+                header += f"  [score: {score:.3f}]"
+            except Exception:
+                pass
+        text = (doc.page_content or "").strip()
+        blocks.append(f"{header}\n{text}")
     return "\n\n".join(blocks)
 
 def strip_parentheses(text: str) -> str:
@@ -301,7 +330,7 @@ if user_q:
     ans = ""
     transcript_text = ""
     spoken_text = ""
-    srcs = []
+    hits = []
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
@@ -312,10 +341,9 @@ if user_q:
                 )
                 context = build_context(hits)
 
-                system_prompt = AUGUSTINE_SYSTEM_PROMPT
                 messages = [
                     {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": AUGUSTINE_SYSTEM_PROMPT},
                     {
                         "role": "user",
                         "content": (
@@ -335,16 +363,13 @@ if user_q:
                 )
                 ans = (resp.choices[0].message.content or "").strip()
 
-                # Extract Document objects for source rendering
-                srcs = [doc for (doc, score) in hits]
-
                 # --- POST-PROCESSING FOR AUDIO-FIRST UI ---
                 transcript_text = limit_to_two_paragraphs(ans)
                 spoken_text = strip_parentheses(transcript_text)
 
             except Exception as e:
                 ans = f"Sorry, I hit an error: `{e}`"
-                srcs = []
+                hits = []
 
             # 1) AUDIO FIRST
             if audio_enabled and ELEVEN_API_KEY and ans.strip():
@@ -363,16 +388,35 @@ if user_q:
                     unsafe_allow_html=True
                 )
 
-            # 3) Sources
-            if srcs:
+            # 3) Sources (robust render + score)
+            if hits:
                 with st.expander("Sources (click to expand)"):
-                    for i, d in enumerate(srcs, 1):
+                    for i, h in enumerate(hits, 1):
+                        if isinstance(h, tuple):
+                            d, sc = h
+                        else:
+                            d, sc = h, None
                         meta = d.metadata or {}
-                        work = meta.get("work_title") or Path(meta.get("source_path","unknown")).stem
-                        page = meta.get("page", "chunk")
-                        st.markdown(f"**{i}. {work}** — {page}")
+                        work = _best_meta_title(meta, fallback=Path(meta.get("source_path","unknown")).stem)
+                        page = _best_meta_page(meta)
+                        line = f"**{i}. {work}** — {page}"
+                        if sc is not None:
+                            try:
+                                line += f"  _(score: {sc:.3f})_"
+                            except Exception:
+                                pass
+                        st.markdown(line)
+
                         excerpt = (d.page_content or "").strip().replace("\n", " ")
                         if excerpt:
                             st.caption(excerpt[:350] + ("…" if len(excerpt) > 350 else ""))
+
+                # Optional debug: raw metadata keys
+                with st.expander("🔧 Debug: raw metadata"):
+                    try:
+                        meta_list = [ (h[0].metadata if isinstance(h, tuple) else h.metadata) for h in hits ]
+                        st.json(meta_list)
+                    except Exception:
+                        st.caption("Could not display raw metadata.")
 
     st.session_state.messages.append({"role": "assistant", "content": ans})

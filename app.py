@@ -1,4 +1,14 @@
 # app.py
+# --- DO NOT MOVE: SQLite JSON1/FTS5 shim for Chroma on Streamlit Cloud ---
+# (Some hosts ship Python's sqlite3 without JSON1; this swaps in pysqlite3.)
+try:
+    import sys
+    import pysqlite3  # SQLite build that includes JSON1/FTS5
+    sys.modules["sqlite3"] = pysqlite3
+except Exception:
+    pass
+# -------------------------------------------------------------------------
+
 import os
 import base64
 import logging
@@ -9,6 +19,14 @@ from typing import Tuple
 
 import streamlit as st
 from openai import OpenAI
+
+# Optional: verify JSON1 at runtime (shows up in Streamlit logs)
+try:
+    import sqlite3
+    opts = [r[0] for r in sqlite3.connect(":memory:").execute("PRAGMA compile_options;").fetchall()]
+    logging.info("SQLite compile options: %s", opts)
+except Exception:
+    logging.exception("Could not inspect SQLite compile options")
 
 # ---------- Quiet noisy libs / warnings ----------
 logging.getLogger("pypdf").setLevel(logging.ERROR)
@@ -138,11 +156,11 @@ def synthesize_tts(text: str, out_path: str) -> str:
         return out_path
     raise RuntimeError(f"ElevenLabs TTS failed. Primary: {reason}. Fallback: {reason_fb}")
 
-# ---------- LangChain bits (READ-ONLY vector DB) ----------
+# ---------- LangChain / Chroma config ----------
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 
-# --- Augustine config ---
+# --- Augustine prompt config ---
 AUGUSTINE_SYSTEM_PROMPT = (
     "You are Augustine of Hippo (354–430). Speak in the FIRST PERSON, "
     "as a pastor counseling someone in your congregation—warm, candid, concise. "
@@ -156,37 +174,46 @@ AUGUSTINE_SYSTEM_PROMPT = (
     "PARENTHESES: You may include brief citations in parentheses; the app will not speak parentheses aloud."
 )
 
-
-DB_DIR = "chroma_db/augustine"   # built by your new ingest.py
+# --- Persisted Chroma config ---
+DB_DIR = Path("./.chroma_db/augustine")   # local, hidden folder in repo
 COLLECTION = "augustine"
-
 RETRIEVAL_K = 5
-SCORE_THRESHOLD = 0.25
+SCORE_THRESHOLD = 0.25  # (unused in Option A; kept for future tuning)
 
-@st.cache_resource
+def get_openai_api_key() -> str:
+    try:
+        return st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        return os.getenv("OPENAI_API_KEY", "")
+
+@st.cache_resource(show_spinner=True)
 def load_vectordb():
-    emb = OpenAIEmbeddings(model="text-embedding-3-large", api_key=OPENAI_API_KEY)
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    emb = OpenAIEmbeddings(
+        model="text-embedding-3-large",
+        api_key=get_openai_api_key(),
+    )
     return Chroma(
-        persist_directory=DB_DIR,
+        persist_directory=str(DB_DIR),
         collection_name=COLLECTION,
-        embedding_function=emb
+        embedding_function=emb,
     )
 
 def build_context(hits) -> str:
+    """Accepts list[(Document, score)] or list[Document] and formats them."""
     blocks = []
     for h in hits:
-        work = h.metadata.get("work_title") or Path(h.metadata.get("source_path","unknown")).stem
-        blocks.append(f"[SOURCE] ({work})\n{(h.page_content or '').strip()}")
+        doc = h[0] if isinstance(h, tuple) else h
+        work = doc.metadata.get("work_title") or Path(doc.metadata.get("source_path", "unknown")).stem
+        blocks.append(f"[SOURCE] ({work})\n{(doc.page_content or '').strip()}")
     return "\n\n".join(blocks)
+
 def strip_parentheses(text: str) -> str:
-    # Remove parenthetical content for the SPOKEN audio
-    # (non-greedy; simple, safe heuristic)
     return re.sub(r"\s*\([^)]*\)", "", text)
 
 def limit_to_two_paragraphs(text: str) -> str:
     paras = [p.strip() for p in text.split("\n") if p.strip()]
     return "\n\n".join(paras[:2])
-
 
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title="Talk to Augustine (Audio-First)", page_icon="📜")
@@ -218,22 +245,11 @@ for msg in st.session_state.messages:
 
 with st.spinner("Loading knowledge base…"):
     vectordb = load_vectordb()
-# Old (breaks):
-# retriever = vectordb.as_retriever(
-#     search_kwargs={"k": RETRIEVAL_K, "score_threshold": SCORE_THRESHOLD}
-# )
-
-# New (works): use MMR or plain similarity without threshold
-retriever = vectordb.as_retriever(
-    search_type="mmr",                 # or "similarity"
-    search_kwargs={"k": RETRIEVAL_K, "fetch_k": 25}
-)
-
 
 # ---------- Sidebar ----------
 with st.sidebar:
     st.subheader("Dataset")
-    st.write("Chroma index loaded from /chroma_db/augustine.")
+    st.write("Chroma index loaded from ./.chroma_db/augustine.")
     st.caption("Source files (cleaned) live under `data/clean_final`. Use the button below to rebuild the index.")
 
     # Optional: rebuild button
@@ -271,7 +287,7 @@ def render_autoplay_audio(file_path: str, autoplay: bool = True):
         unsafe_allow_html=True,
     )
 
-# ---------- Chat ----------
+# ---------- Chat (Option A retrieval wired in) ----------
 user_q = st.chat_input("Ask your question…")
 if user_q:
     if not isinstance(user_q, str) or not user_q.strip():
@@ -282,15 +298,21 @@ if user_q:
     with st.chat_message("user"):
         st.markdown(user_q)
 
+    ans = ""
+    transcript_text = ""
+    spoken_text = ""
+    srcs = []
+
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
             try:
-                hits = retriever.get_relevant_documents(user_q)
-
-                # Build system prompt + context
-                system_prompt = AUGUSTINE_SYSTEM_PROMPT
+                # OPTION A: simple top-k search (returns list of (Document, score))
+                hits = vectordb.similarity_search_with_relevance_scores(
+                    user_q, k=RETRIEVAL_K
+                )
                 context = build_context(hits)
 
+                system_prompt = AUGUSTINE_SYSTEM_PROMPT
                 messages = [
                     {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "system", "content": system_prompt},
@@ -299,7 +321,7 @@ if user_q:
                         "content": (
                             f"{user_q}\n\n"
                             "Context (top passages from Augustine's works):\n"
-                            f"{context if context.strip() else '(no strong matches)'}"
+                            f"{context if context.strip() else '(no strong matches)'}\n\n"
                             "Reminder: Attribute Bible verses as Scripture (e.g., 'as Scripture says …'), "
                             "and never as something you authored. Keep the answer to at most two short paragraphs."
                         ),
@@ -311,29 +333,37 @@ if user_q:
                     messages=messages,
                     temperature=0.3,
                 )
-                ans = resp.choices[0].message.content
-                srcs = hits
-                    # --- NEW POST-PROCESSING ---
+                ans = (resp.choices[0].message.content or "").strip()
+
+                # Extract Document objects for source rendering
+                srcs = [doc for (doc, score) in hits]
+
+                # --- POST-PROCESSING FOR AUDIO-FIRST UI ---
                 transcript_text = limit_to_two_paragraphs(ans)
                 spoken_text = strip_parentheses(transcript_text)
+
             except Exception as e:
-                ans, srcs = f"Sorry, I hit an error: `{e}`", []
+                ans = f"Sorry, I hit an error: `{e}`"
+                srcs = []
 
             # 1) AUDIO FIRST
             if audio_enabled and ELEVEN_API_KEY and ans.strip():
                 try:
                     out_dir = Path("audio"); out_dir.mkdir(exist_ok=True)
                     audio_path = out_dir / f"reply_{len(st.session_state.messages)}.mp3"
-                    synthesize_tts(spoken_text, str(audio_path))
+                    synthesize_tts(spoken_text or ans, str(audio_path))
                     render_autoplay_audio(str(audio_path), autoplay=bool(autoplay_enabled))
                 except Exception as e:
                     st.warning(f"Audio generation failed: {e}")
 
             # 2) CAPTIONS
             with st.expander("📝 Transcript (click to show/hide)", expanded=False):
-                st.markdown(f"<div class='caption-box'>{transcript_text}</div>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='caption-box'>{(transcript_text or ans)}</div>",
+                    unsafe_allow_html=True
+                )
 
-            # 3) Sources (leaving your existing expander intact)
+            # 3) Sources
             if srcs:
                 with st.expander("Sources (click to expand)"):
                     for i, d in enumerate(srcs, 1):

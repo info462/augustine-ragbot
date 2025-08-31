@@ -135,6 +135,8 @@ def rebuild_vectorstore():
     )
 
     print(f"[INGEST] Vector store rebuilt at '{DB_DIR}' (collection '{COLLECTION}').")
+    print(f"[INGEST] Loaded {len(docs)} docs into vectorstore.")
+    return len(docs)
 
 if __name__ == "__main__":
     rebuild_vectorstore()

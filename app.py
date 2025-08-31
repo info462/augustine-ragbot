@@ -178,19 +178,14 @@ AUGUSTINE_SYSTEM_PROMPT = (
     "PARENTHESES: You may include brief citations in parentheses; the app will not speak parentheses aloud."
 )
 
-# --- Persisted Chroma config (try both old/new paths) ---
-DB_DIR_CANDIDATES = [Path("chroma_db/augustine"), Path(".chroma_db/augustine")]
+# --- Persisted Chroma config (LOCKED to ingest path) ---
+from pathlib import Path
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+
+DB_DIR = Path("chroma_db/augustine")   # MUST match ingest.py
 COLLECTION = "augustine"
 RETRIEVAL_K = 5
-SCORE_THRESHOLD = 0.25  # unused in Option A
-
-def _resolve_db_dir() -> Path:
-    for p in DB_DIR_CANDIDATES:
-        if p.exists() and any(p.iterdir()):
-            return p
-    return DB_DIR_CANDIDATES[0]  # default/fallback
-
-DB_DIR = _resolve_db_dir()
 
 @st.cache_resource(show_spinner=True)
 def load_vectordb():
@@ -207,7 +202,6 @@ def index_count(vdb) -> int | None:
         return vdb._collection.count()
     except Exception:
         return None
-
 
 
 # ---------- Robust source formatting ----------
@@ -292,22 +286,51 @@ with st.spinner("Loading knowledge base…"):
 # ---------- Sidebar ----------
 with st.sidebar:
     st.subheader("Dataset")
+
+    # Show where we're loading from and how many chunks are in the index
     st.caption(f"📂 Index path: `{DB_DIR}`")
     st.caption(f"🧩 Chunks in index: **{index_count(vectordb)}**")
-    st.write("Chroma index loaded from ./.chroma_db/augustine.")
+
+    st.write("Chroma index loaded from `chroma_db/augustine`.")
     st.caption("Source files (cleaned) live under `data/clean_final`. Use the button below to rebuild the index.")
-   
-test_q = st.text_input("🔎 Test query (debug)", value="grace and will")
-if st.button("Run test retrieval"):
+
+    # Rebuild index (txt-only ingest) and FORCE reload of the cached DB
     try:
-        test_hits = vectordb.similarity_search_with_relevance_scores(test_q, k=3)
-        st.session_state.last_hits = test_hits  # so the main expander shows them
-        st.success(f"Retrieved {len(test_hits)} chunk(s). See Sources expander.")
-        # Show raw metadata immediately here too
-        st.write("Raw metadata:")
-        st.json([ (h[0].metadata if isinstance(h, tuple) else h.metadata) for h in test_hits ])
+        from ingest import rebuild_vectorstore
+        if st.button("🔁 Rebuild index from data/clean_final"):
+            import os
+            os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # secrets → env for ingest.py
+            with st.spinner("Rebuilding vector store…"):
+                rebuild_vectorstore()      # writes to chroma_db/augustine
+            # IMPORTANT: clear cached DB and reload so we see new chunks now
+            load_vectordb.clear()
+            vectordb = load_vectordb()
+            st.success(f"Done. Chunks in index: {index_count(vectordb)}")
     except Exception as e:
-        st.error(f"Test retrieval error: {e}")
+        st.caption(f"`ingest.py` not found, rebuild button disabled. ({e})")
+
+    # Debug tester (keep this inside the sidebar)
+    test_q = st.text_input("🔎 Test query (debug)", value="grace and will")
+    if st.button("Run test retrieval"):
+        try:
+            test_hits = vectordb.similarity_search_with_relevance_scores(test_q, k=3)
+            st.session_state.last_hits = test_hits  # main expander will show them
+            st.success(f"Retrieved {len(test_hits)} chunk(s). See Sources expander.")
+            st.write("Raw metadata:")
+            st.json([ (h[0].metadata if isinstance(h, tuple) else h.metadata) for h in test_hits ])
+        except Exception as e:
+            st.error(f"Test retrieval error: {e}")
+
+    st.subheader("Audio")
+    ok, reason = eleven_preflight()
+    if ok:
+        audio_enabled    = st.toggle("🔊 Speak answers (default ON)", value=True)
+        autoplay_enabled = st.toggle("▶️ Auto-play audio (default ON)", value=True)
+    else:
+        audio_enabled = False
+        autoplay_enabled = False
+        st.info(reason)
+
 
     # Optional: rebuild button
     try:

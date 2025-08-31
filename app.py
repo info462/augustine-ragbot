@@ -307,16 +307,17 @@ with st.sidebar:
     # Rebuild index (txt-only ingest) and FORCE reload of the cached DB
     try:
         from ingest import rebuild_vectorstore
-        if st.button("🔁 Rebuild index from data/clean_final", key="rebuild_btn"):
-            os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # secrets → env for ingest.py
-            with st.spinner("Rebuilding vector store…"):
-                rebuild_vectorstore()      # writes to chroma_db/augustine
-            # IMPORTANT: clear cached DB and reload so we see new chunks now
-            load_vectordb.clear()
-            vectordb = load_vectordb()
-            st.success(f"Done. Chunks in index: {index_count(vectordb)}")
-    except Exception as e:
-        st.caption(f"`ingest.py` not found, rebuild button disabled. ({e})")
+       if st.button("🔁 Rebuild index from data/clean_final", key="rebuild_btn"):
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+    with st.spinner("Rebuilding vector store…"):
+        try:
+            chunk_count = rebuild_vectorstore()
+        except Exception as e:
+            st.error(f"Ingest failed: {e}")
+            chunk_count = 0
+    load_vectordb.clear()
+    vectordb = load_vectordb()
+    st.success(f"Done. Chunks in index: {chunk_count}")
 
     # Debug tester
     test_q = st.text_input("🔎 Test query (debug)", value="grace and will", key="test_query_input")

@@ -123,21 +123,26 @@ def rebuild_vectorstore():
     if not docs:
         raise RuntimeError("No documents were loaded. Check your data folder.")
 
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+    embeddings = OpenAIEmbeddings(
+        model="text-embedding-3-large", 
+        api_key=os.getenv("OPENAI_API_KEY")  # make sure key is passed explicitly
+    )
 
     vdb = Chroma.from_documents(
         documents=docs,
-        embedding=embeddings,
-        persist_directory=DB_DIR,
+        embedding=embeddings,             # correct kwarg for langchain_community
+        persist_directory=str(DB_DIR),    # ensure it's a string path
         collection_name=COLLECTION,
     )
 
-    # FORCE persist
+    # Force a persist to disk
     vdb.persist()
 
+    # Ask Chroma how many chunks are inside
     count = vdb._collection.count()
-    print(f"[INGEST] Rebuilt at '{DB_DIR}' (collection '{COLLECTION}') with {count} chunks.")
+    print(f"[INGEST] Vector store rebuilt at '{DB_DIR}' (collection '{COLLECTION}') with {count} chunks.")
     return count
+
 
 
 if __name__ == "__main__":

@@ -66,9 +66,14 @@ except Exception:
 if not OPENAI_API_KEY:
     st.error("❌ Missing OPENAI_API_KEY. Add to `.streamlit/secrets.toml` or Streamlit Cloud → Settings → Secrets.")
     st.stop()
-
 # Make sure downstream libs see the key via env
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+
+# Silence Chroma telemetry noise on Streamlit Cloud
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+os.environ["CHROMA_TELEMETRY_IMPLEMENTATION"] = "none"
+# (optional) reduce Chroma logging
+os.environ["CHROMA_LOG_LEVEL"] = "ERROR"
 
 # ---------- OpenAI client ----------
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -287,6 +292,17 @@ with st.sidebar:
 
     st.write("Chroma index loaded from `chroma_db/augustine`.")
     st.caption("Source files (cleaned) live under `data/clean_final`. Use the button below to rebuild the index.")
+
+        # Debug: check if Streamlit sees the .txt files
+    try:
+        from itertools import islice
+        txts = list(islice(Path("data/clean_final").rglob("*.txt"), 5))
+        total_txts = len(list(Path("data/clean_final").rglob("*.txt")))
+        st.caption(f"🗂️ Found {total_txts} .txt files under data/clean_final")
+        if txts:
+            st.write("Examples:", [str(p) for p in txts])
+    except Exception as e:
+        st.warning(f"Could not list data/clean_final: {e}")
 
     # Rebuild index (txt-only ingest) and FORCE reload of the cached DB
     try:

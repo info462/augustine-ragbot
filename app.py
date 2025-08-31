@@ -308,7 +308,7 @@ with st.sidebar:
     try:
         from ingest import rebuild_vectorstore
         if st.button("🔁 Rebuild index from data/clean_final", key="rebuild_btn"):
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+        os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
     with st.spinner("Rebuilding vector store…"):
         try:
             chunk_count = rebuild_vectorstore()

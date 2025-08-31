@@ -1,6 +1,5 @@
 # app.py
 # --- DO NOT MOVE: SQLite JSON1/FTS5 shim for Chroma on Streamlit Cloud ---
-# (Some hosts ship Python's sqlite3 without JSON1; this swaps in pysqlite3.)
 try:
     import sys
     import pysqlite3  # SQLite build that includes JSON1/FTS5
@@ -67,9 +66,9 @@ except Exception:
 if not OPENAI_API_KEY:
     st.error("❌ Missing OPENAI_API_KEY. Add to `.streamlit/secrets.toml` or Streamlit Cloud → Settings → Secrets.")
     st.stop()
+
 # Make sure downstream libs see the key via env
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-
 
 # ---------- OpenAI client ----------
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -179,10 +178,6 @@ AUGUSTINE_SYSTEM_PROMPT = (
 )
 
 # --- Persisted Chroma config (LOCKED to ingest path) ---
-from pathlib import Path
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
-
 DB_DIR = Path("chroma_db/augustine")   # MUST match ingest.py
 COLLECTION = "augustine"
 RETRIEVAL_K = 5
@@ -202,7 +197,6 @@ def index_count(vdb) -> int | None:
         return vdb._collection.count()
     except Exception:
         return None
-
 
 # ---------- Robust source formatting ----------
 def _best_meta_title(meta: dict, fallback: str = "unknown") -> str:
@@ -272,7 +266,7 @@ st.divider()
 # Chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
-# NEW: persist last hits for showing Sources even across reruns
+# persist last hits for showing Sources even across reruns
 if "last_hits" not in st.session_state:
     st.session_state.last_hits = []
 
@@ -294,52 +288,37 @@ with st.sidebar:
     st.write("Chroma index loaded from `chroma_db/augustine`.")
     st.caption("Source files (cleaned) live under `data/clean_final`. Use the button below to rebuild the index.")
 
-
-# Rebuild index button
-if st.button("🔁 Rebuild index from data/clean_final", key="rebuild_btn"):
-    import os
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-    with st.spinner("Rebuilding vector store…"):
-        rebuild_vectorstore()
-    load_vectordb.clear()
-    vectordb = load_vectordb()
-    st.success(f"Done. Chunks in index: {index_count(vectordb)}")
-
-# Debug tester
-test_q = st.text_input("🔎 Test query (debug)", value="grace and will", key="test_query_input")
-if st.button("Run test retrieval", key="test_retrieval_btn"):
+    # Rebuild index (txt-only ingest) and FORCE reload of the cached DB
     try:
-        test_hits = vectordb.similarity_search_with_relevance_scores(test_q, k=3)
-        st.session_state.last_hits = test_hits
-        st.success(f"Retrieved {len(test_hits)} chunk(s). See Sources expander.")
-        st.write("Raw metadata:")
-        st.json([ (h[0].metadata if isinstance(h, tuple) else h.metadata) for h in test_hits ])
-    except Exception as e:
-        st.error(f"Test retrieval error: {e}")
-
-# Audio toggles (add unique keys)
-audio_enabled    = st.toggle("🔊 Speak answers (default ON)", value=True, key="audio_enabled_toggle")
-autoplay_enabled = st.toggle("▶️ Auto-play audio (default ON)", value=True, key="autoplay_enabled_toggle")
-
-
-    # Optional: rebuild button
-try:
         from ingest import rebuild_vectorstore
-        if st.button("🔁 Rebuild index from data/clean_final"):
-            import os
-            os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # <-- bridge secrets → env
+        if st.button("🔁 Rebuild index from data/clean_final", key="rebuild_btn"):
+            os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # secrets → env for ingest.py
             with st.spinner("Rebuilding vector store…"):
-                rebuild_vectorstore()
-            st.success("Done. Reload the page to use the new index.")
-    except Exception:
-        st.caption("`ingest.py` not found, rebuild button disabled.")
+                rebuild_vectorstore()      # writes to chroma_db/augustine
+            # IMPORTANT: clear cached DB and reload so we see new chunks now
+            load_vectordb.clear()
+            vectordb = load_vectordb()
+            st.success(f"Done. Chunks in index: {index_count(vectordb)}")
+    except Exception as e:
+        st.caption(f"`ingest.py` not found, rebuild button disabled. ({e})")
 
+    # Debug tester
+    test_q = st.text_input("🔎 Test query (debug)", value="grace and will", key="test_query_input")
+    if st.button("Run test retrieval", key="test_retrieval_btn"):
+        try:
+            test_hits = vectordb.similarity_search_with_relevance_scores(test_q, k=3)
+            st.session_state.last_hits = test_hits  # main expander will show them
+            st.success(f"Retrieved {len(test_hits)} chunk(s). See Sources expander.")
+            st.write("Raw metadata:")
+            st.json([ (h[0].metadata if isinstance(h, tuple) else h.metadata) for h in test_hits ])
+        except Exception as e:
+            st.error(f"Test retrieval error: {e}")
 
     st.subheader("Audio")
     ok, reason = eleven_preflight()
     if ok:
-        audio_enabled    = st.toggle("🔊 Speak answers (default ON)", value=True)
-        autoplay_enabled = st.toggle("▶️ Auto-play audio (default ON)", value=True)
+        audio_enabled    = st.toggle("🔊 Speak answers (default ON)", value=True, key="audio_enabled_toggle")
+        autoplay_enabled = st.toggle("▶️ Auto-play audio (default ON)", value=True, key="autoplay_enabled_toggle")
     else:
         audio_enabled = False
         autoplay_enabled = False
@@ -382,7 +361,7 @@ if user_q:
                 hits = vectordb.similarity_search_with_relevance_scores(
                     user_q, k=RETRIEVAL_K
                 )
-                st.session_state.last_hits = hits  # <-- persist for the Sources section
+                st.session_state.last_hits = hits  # persist for the Sources section
                 context = build_context(hits)
 
                 messages = [

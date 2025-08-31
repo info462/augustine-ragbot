@@ -323,7 +323,7 @@ autoplay_enabled = st.toggle("▶️ Auto-play audio (default ON)", value=True, 
 
 
     # Optional: rebuild button
-        try:
+try:
         from ingest import rebuild_vectorstore
         if st.button("🔁 Rebuild index from data/clean_final"):
             import os

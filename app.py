@@ -294,42 +294,32 @@ with st.sidebar:
     st.write("Chroma index loaded from `chroma_db/augustine`.")
     st.caption("Source files (cleaned) live under `data/clean_final`. Use the button below to rebuild the index.")
 
-    # Rebuild index (txt-only ingest) and FORCE reload of the cached DB
+
+# Rebuild index button
+if st.button("🔁 Rebuild index from data/clean_final", key="rebuild_btn"):
+    import os
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+    with st.spinner("Rebuilding vector store…"):
+        rebuild_vectorstore()
+    load_vectordb.clear()
+    vectordb = load_vectordb()
+    st.success(f"Done. Chunks in index: {index_count(vectordb)}")
+
+# Debug tester
+test_q = st.text_input("🔎 Test query (debug)", value="grace and will", key="test_query_input")
+if st.button("Run test retrieval", key="test_retrieval_btn"):
     try:
-        from ingest import rebuild_vectorstore
-        if st.button("🔁 Rebuild index from data/clean_final"):
-            import os
-            os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # secrets → env for ingest.py
-            with st.spinner("Rebuilding vector store…"):
-                rebuild_vectorstore()      # writes to chroma_db/augustine
-            # IMPORTANT: clear cached DB and reload so we see new chunks now
-            load_vectordb.clear()
-            vectordb = load_vectordb()
-            st.success(f"Done. Chunks in index: {index_count(vectordb)}")
+        test_hits = vectordb.similarity_search_with_relevance_scores(test_q, k=3)
+        st.session_state.last_hits = test_hits
+        st.success(f"Retrieved {len(test_hits)} chunk(s). See Sources expander.")
+        st.write("Raw metadata:")
+        st.json([ (h[0].metadata if isinstance(h, tuple) else h.metadata) for h in test_hits ])
     except Exception as e:
-        st.caption(f"`ingest.py` not found, rebuild button disabled. ({e})")
+        st.error(f"Test retrieval error: {e}")
 
-    # Debug tester (keep this inside the sidebar)
-    test_q = st.text_input("🔎 Test query (debug)", value="grace and will")
-    if st.button("Run test retrieval"):
-        try:
-            test_hits = vectordb.similarity_search_with_relevance_scores(test_q, k=3)
-            st.session_state.last_hits = test_hits  # main expander will show them
-            st.success(f"Retrieved {len(test_hits)} chunk(s). See Sources expander.")
-            st.write("Raw metadata:")
-            st.json([ (h[0].metadata if isinstance(h, tuple) else h.metadata) for h in test_hits ])
-        except Exception as e:
-            st.error(f"Test retrieval error: {e}")
-
-    st.subheader("Audio")
-    ok, reason = eleven_preflight()
-    if ok:
-        audio_enabled    = st.toggle("🔊 Speak answers (default ON)", value=True)
-        autoplay_enabled = st.toggle("▶️ Auto-play audio (default ON)", value=True)
-    else:
-        audio_enabled = False
-        autoplay_enabled = False
-        st.info(reason)
+# Audio toggles (add unique keys)
+audio_enabled    = st.toggle("🔊 Speak answers (default ON)", value=True, key="audio_enabled_toggle")
+autoplay_enabled = st.toggle("▶️ Auto-play audio (default ON)", value=True, key="autoplay_enabled_toggle")
 
 
     # Optional: rebuild button

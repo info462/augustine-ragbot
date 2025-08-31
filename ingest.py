@@ -115,7 +115,7 @@ def load_and_split_docs(root: Path) -> List[Document]:
 
 def rebuild_vectorstore():
     """Wipe and rebuild the persistent Chroma index from DOC_ROOT (txt only)."""
-    # Clear existing to avoid stale state
+    # Clear existing
     if Path(DB_DIR).exists():
         shutil.rmtree(DB_DIR, ignore_errors=True)
 
@@ -123,20 +123,22 @@ def rebuild_vectorstore():
     if not docs:
         raise RuntimeError("No documents were loaded. Check your data folder.")
 
-    embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-large"  # key picked up from env
-    )
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
 
-    _ = Chroma.from_documents(
+    vdb = Chroma.from_documents(
         documents=docs,
-        embedding=embeddings,            # correct kwarg for langchain_community
+        embedding=embeddings,
         persist_directory=DB_DIR,
         collection_name=COLLECTION,
     )
 
-    print(f"[INGEST] Vector store rebuilt at '{DB_DIR}' (collection '{COLLECTION}').")
-    print(f"[INGEST] Loaded {len(docs)} docs into vectorstore.")
-    return len(docs)
+    # FORCE persist
+    vdb.persist()
+
+    count = vdb._collection.count()
+    print(f"[INGEST] Rebuilt at '{DB_DIR}' (collection '{COLLECTION}') with {count} chunks.")
+    return count
+
 
 if __name__ == "__main__":
     rebuild_vectorstore()

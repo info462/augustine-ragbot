@@ -307,7 +307,7 @@ with st.sidebar:
     # Rebuild index (txt-only ingest) and FORCE reload of the cached DB
     try:
         from ingest import rebuild_vectorstore
-       if st.button("🔁 Rebuild index from data/clean_final", key="rebuild_btn"):
+        if st.button("🔁 Rebuild index from data/clean_final", key="rebuild_btn"):
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
     with st.spinner("Rebuilding vector store…"):
         try:

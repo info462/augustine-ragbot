@@ -4,5 +4,6 @@ langchain>=0.2.10
 langchain-community>=0.2.10
 langchain-openai>=0.1.14
 tiktoken>=0.7
-chromadb>=0.5.3
+chromadb==0.4.24
+numpy<2
 pydantic>=2.6

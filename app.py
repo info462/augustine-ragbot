@@ -106,4 +106,51 @@ SYSTEM_PROMPT = """You are St. Augustine scholar-bot. Answer strictly from the r
 If unsure, say you don't know. Always cite sources with file path and chunk number.
 """
 
-qa_prompt = PromptTem_
+qa_prompt = PromptTemplate(
+    input_variables=["context", "question"],
+    template=SYSTEM_PROMPT + "\nContext:\n{context}\n\nQuestion: {question}\n\nAnswer:",
+)
+
+def build_qa(vs: FAISS) -> RetrievalQA:
+    llm = ChatOpenAI(model=CHAT_MODEL, temperature=0)
+    retriever = vs.as_retriever(search_kwargs={"k": 4})
+    return RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=retriever,
+        chain_type_kwargs={"prompt": qa_prompt},
+        return_source_documents=True,
+    )
+
+def render_sources(src_docs: List):
+    if not src_docs:
+        st.info("No sources returned.")
+        return
+    st.subheader("Sources")
+    for i, d in enumerate(src_docs, 1):
+        meta = d.metadata or {}
+        source = meta.get("source", "unknown")
+        chunk_id = meta.get("chunk")
+        label = f"{source}" + (f" — chunk {chunk_id}" if chunk_id is not None else "")
+        with st.expander(f"{i}. {label}", expanded=False):
+            body = d.page_content or ""
+            st.write(body[:1200] + ("..." if len(body) > 1200 else ""))
+
+# ---------- Main ----------
+st.title("Ask St. Augustine Anything")
+st.caption("Answers are drawn exclusively from his writings")
+
+if vectordb is None:
+    st.warning("Index not found. Use the **Rebuild index** button in the sidebar. When it finishes, this page will auto-load the index.")
+else:
+    qa = build_qa(vectordb)
+    q = st.text_input("Ask:", value="Teach me about grace", help="The bot cites exact files/chunks")
+    if st.button("Ask"):
+        if collection_count(vectordb) == 0:
+            st.error("Index is empty. Click **Rebuild index** in the sidebar first.")
+        else:
+            with st.spinner("Thinking…"):
+                out = qa({"query": q})
+            st.markdown("### Answer")
+            st.write(out["result"])
+            render_sources(out.get("source_documents", []))

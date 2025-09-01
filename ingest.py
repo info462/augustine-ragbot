@@ -3,6 +3,16 @@ import os
 import shutil
 from pathlib import Path
 from typing import List
+from chromadb.config import Settings
+CHROMA_SETTINGS = Settings(anonymized_telemetry=False)
+
+# when you create/load Chroma (in BOTH files)
+Chroma(
+    embedding_function=embeddings,
+    persist_directory=PERSIST_DIR,
+    collection_name=COLLECTION_NAME,
+    client_settings=CHROMA_SETTINGS,
+)
 
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter

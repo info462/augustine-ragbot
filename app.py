@@ -12,10 +12,11 @@ from langchain.prompts import PromptTemplate
 # ---------- Constants (must match ingest.py) ----------
 DATA_DIR = Path("data/clean_final")
 FAISS_DIR = "faiss_index/augustine"
+INDEX_NAME = "index"                         # must match ingest.py
 EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o-mini"
 
-# ---------- Secrets / keys ----------
+# ---------- Secrets ----------
 def get_secret(key: str, default: str | None = None) -> str | None:
     try:
         if key in st.secrets:
@@ -26,7 +27,7 @@ def get_secret(key: str, default: str | None = None) -> str | None:
 
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 ELEVEN_API_KEY = get_secret("ELEVENLABS_API_KEY")  # optional
-audio_enabled = bool(ELEVEN_API_KEY)               # avoid NameError
+audio_enabled = bool(ELEVEN_API_KEY)
 
 if not OPENAI_API_KEY:
     st.error("OPENAI_API_KEY missing. Add it in Streamlit Secrets.")
@@ -34,12 +35,24 @@ if not OPENAI_API_KEY:
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 # ---------- Vector store ----------
+def _faiss_files_exist() -> bool:
+    base = Path(FAISS_DIR)
+    return (base / f"{INDEX_NAME}.faiss").exists() and (base / f"{INDEX_NAME}.pkl").exists()
+
 @st.cache_resource(show_spinner=False)
 def load_vectordb():
     embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
-    # allow_dangerous_deserialization is required on Streamlit Cloud
+
+    # If index missing on first run, build it automatically
+    if not _faiss_files_exist():
+        from ingest import rebuild_vectorstore
+        rebuild_vectorstore()
+
     return FAISS.load_local(
-        FAISS_DIR, embeddings, allow_dangerous_deserialization=True
+        FAISS_DIR,
+        embeddings,
+        index_name=INDEX_NAME,
+        allow_dangerous_deserialization=True,  # required on Streamlit Cloud
     )
 
 def collection_count(vs: FAISS) -> int:
@@ -48,11 +61,10 @@ def collection_count(vs: FAISS) -> int:
     except Exception:
         return 0
 
-# ---------- UI: sidebar ----------
+# ---------- UI ----------
 st.set_page_config(page_title="Ask St. Augustine Anything", layout="wide")
-
 st.sidebar.header("Dataset")
-st.sidebar.write(f"**Index path:** `{FAISS_DIR}`")
+st.sidebar.write(f"**Index path:** `{FAISS_DIR}/{INDEX_NAME}`")
 
 txts = sorted([str(p) for p in DATA_DIR.rglob("*.txt")])
 st.sidebar.write(f"**Found {len(txts)} .txt files under** `data/clean_final`.")

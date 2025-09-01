@@ -9,9 +9,10 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 
 # ---------- Constants (must match app.py) ----------
-DATA_DIR = Path("data/clean_final")          # where your .txt files live
-FAISS_DIR = "faiss_index/augustine"          # saved FAISS folder
-EMBED_MODEL = "text-embedding-3-small"       # inexpensive + solid
+DATA_DIR = Path("data/clean_final")          # your .txt files
+FAISS_DIR = "faiss_index/augustine"          # folder to save index
+INDEX_NAME = "index"                         # base filename for FAISS files
+EMBED_MODEL = "text-embedding-3-small"
 
 def _read_all_txt_files(root: Path) -> List[Document]:
     docs: List[Document] = []
@@ -22,7 +23,7 @@ def _read_all_txt_files(root: Path) -> List[Document]:
 
 def rebuild_vectorstore() -> int:
     """
-    Build a FAISS index from DATA_DIR and save under FAISS_DIR.
+    Build a FAISS index from DATA_DIR and save under FAISS_DIR/INDEX_NAME.
     Returns number of chunks written.
     """
     if not DATA_DIR.exists():
@@ -35,14 +36,13 @@ def rebuild_vectorstore() -> int:
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     chunks = splitter.split_documents(raw_docs)
 
-    # Add a numeric chunk id for nicer source display
+    # tag chunks for nicer source display
     for i, d in enumerate(chunks):
         d.metadata["chunk"] = i
 
     embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
     vs = FAISS.from_documents(chunks, embeddings)
 
-    # Ensure parent dir exists, then save
     Path(FAISS_DIR).mkdir(parents=True, exist_ok=True)
-    vs.save_local(FAISS_DIR)
+    vs.save_local(FAISS_DIR, index_name=INDEX_NAME)
     return len(chunks)

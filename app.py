@@ -1,4 +1,4 @@
-# app.py (FAISS, lazy-load, resilient)
+# app.py (FAISS lazy-load + diagnostics)
 import os
 import shutil
 from pathlib import Path
@@ -10,13 +10,13 @@ from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
-# ----- Page must be first to avoid blank UI while loading -----
+# ----- Page first to avoid blank UI -----
 st.set_page_config(page_title="Ask St. Augustine Anything", layout="wide")
 
 # ---------- Constants (must match ingest.py) ----------
 DATA_DIR = Path("data/clean_final")
 FAISS_DIR = Path("faiss_index/augustine")
-INDEX_NAME = "index"  # must match ingest.py
+INDEX_NAME = "index"
 EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o-mini"
 
@@ -48,7 +48,6 @@ def reset_index_folder():
 
 @st.cache_resource(show_spinner=False)
 def load_vectordb() -> Optional[FAISS]:
-    """Return FAISS instance if files exist; otherwise None (no blocking/rebuild here)."""
     if not faiss_files_exist():
         return None
     embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
@@ -60,7 +59,6 @@ def load_vectordb() -> Optional[FAISS]:
             allow_dangerous_deserialization=True,
         )
     except Exception:
-        # Corrupt index → wipe and tell user to rebuild
         reset_index_folder()
         return None
 
@@ -73,35 +71,51 @@ def collection_count(vs: Optional[FAISS]) -> int:
 # ---------- Sidebar ----------
 st.sidebar.header("Dataset")
 st.sidebar.write(f"**Index path:** `{FAISS_DIR}/{INDEX_NAME}`")
-
 txts = sorted([str(p) for p in DATA_DIR.rglob("*.txt")])
 st.sidebar.write(f"**Found {len(txts)} .txt files under** `data/clean_final`.")
 with st.sidebar.expander("Examples", expanded=False):
     st.code(txts[:10] if txts else "[]", language="json")
 
-# Rebuild
+# Buttons
 if st.sidebar.button("Rebuild index from data/clean_final"):
-    with st.spinner("Rebuilding vector store…"):
+    with st.status("Rebuilding vector store…", expanded=True) as s:
+        logs = []
+        def log(msg: str):
+            logs.append(msg)
+            s.update(label="Rebuilding vector store…", state="running")
+            st.write("• " + msg)
+
         try:
             from ingest import rebuild_vectorstore
-            chunks = rebuild_vectorstore()
+            chunks = rebuild_vectorstore(progress=log)
+            s.update(label=f"Rebuild complete. {chunks} chunks.", state="complete")
             st.success(f"Done. Chunks in index: {chunks}")
         except Exception as e:
+            s.update(label="Rebuild failed.", state="error")
             st.error(f"Ingest failed: {e}")
     load_vectordb.clear()
 
-# Reset (in case the index got corrupted)
 if st.sidebar.button("Reset / delete index folder"):
     reset_index_folder()
     load_vectordb.clear()
     st.sidebar.success("Index folder deleted. Click Rebuild next.")
+
+# Diagnostics
+with st.sidebar.expander("Diagnostics", expanded=False):
+    if st.button("Test embeddings now"):
+        try:
+            emb = OpenAIEmbeddings(model=EMBED_MODEL)
+            v = emb.embed_query("hello")
+            st.success(f"Embeddings OK. Vector length: {len(v)}")
+        except Exception as e:
+            st.error(f"Embedding call FAILED: {e}")
 
 # ---------- Load DB (non-blocking) ----------
 vectordb = load_vectordb()
 st.sidebar.write(f"**Chunks in index:** {collection_count(vectordb)}")
 st.sidebar.write("Audio: " + ("enabled" if audio_enabled else "disabled"))
 
-# ---------- RAG chain (only if DB is ready) ----------
+# ---------- RAG (only when ready) ----------
 SYSTEM_PROMPT = """You are St. Augustine scholar-bot. Answer strictly from the retrieved context.
 If unsure, say you don't know. Always cite sources with file path and chunk number.
 """
@@ -141,7 +155,7 @@ st.title("Ask St. Augustine Anything")
 st.caption("Answers are drawn exclusively from his writings")
 
 if vectordb is None:
-    st.warning("Index not found. Use the **Rebuild index** button in the sidebar. When it finishes, this page will auto-load the index.")
+    st.warning("Index not found. Use the **Rebuild index** button in the sidebar. Live logs will appear during rebuild.")
 else:
     qa = build_qa(vectordb)
     q = st.text_input("Ask:", value="Teach me about grace", help="The bot cites exact files/chunks")

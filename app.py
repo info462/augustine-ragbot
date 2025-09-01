@@ -1,471 +1,144 @@
 # app.py
-# --- DO NOT MOVE: SQLite JSON1/FTS5 shim for Chroma on Streamlit Cloud ---
-try:
-    import sys
-    import pysqlite3  # SQLite build that includes JSON1/FTS5
-    sys.modules["sqlite3"] = pysqlite3
-except Exception:
-    pass
-# -------------------------------------------------------------------------
-
 import os
-import base64
-import logging
-import warnings
-import re
 from pathlib import Path
-from typing import Tuple
+from typing import List, Tuple
 
 import streamlit as st
-from openai import OpenAI
-import requests
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
 
-# Optional: verify JSON1 at runtime (shows up in Streamlit logs)
-try:
-    import sqlite3
-    opts = [r[0] for r in sqlite3.connect(":memory:").execute("PRAGMA compile_options;").fetchall()]
-    logging.info("SQLite compile options: %s", opts)
-except Exception:
-    logging.exception("Could not inspect SQLite compile options")
+# ---------- Constants (MUST MATCH ingest.py) ----------
+DATA_DIR = Path("data/clean_final")
+PERSIST_DIR = "chroma_db/augustine"
+COLLECTION_NAME = "augustine"
+EMBED_MODEL = "text-embedding-3-small"
+CHAT_MODEL = "gpt-4o-mini"
 
-# ---------- Quiet noisy libs / warnings ----------
-logging.getLogger("pypdf").setLevel(logging.ERROR)
-try:
-    from langchain_core._api import LangChainDeprecationWarning
-    warnings.filterwarnings("ignore", category=LangChainDeprecationWarning)
-except Exception:
-    pass
-
-# ---------- Secrets loader ----------
+# ---------- Secrets ----------
 def get_secret(key: str, default: str | None = None) -> str | None:
     try:
         if key in st.secrets:
             return st.secrets[key]
     except Exception:
         pass
-    val = os.getenv(key)
-    if val:
-        return val
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-        return os.getenv(key, default)
-    except Exception:
-        return default
+    return os.getenv(key, default)
 
-# ---------- API keys / voice selection ----------
-OPENAI_API_KEY  = (get_secret("OPENAI_API_KEY") or "").strip()
-ELEVEN_API_KEY  = (get_secret("ELEVEN_API_KEY") or "").strip()
-ELEVEN_VOICE_ID = (get_secret("ELEVEN_VOICE_ID") or "").strip()
-
-try:
-    ELEVEN_VERBOSE_ERRORS = bool(st.secrets.get("ELEVEN_VERBOSE_ERRORS", False))
-except Exception:
-    ELEVEN_VERBOSE_ERRORS = False
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+ELEVEN_API_KEY = get_secret("ELEVENLABS_API_KEY")  # optional
+audio_enabled = bool(ELEVEN_API_KEY)  # <-- define this once so it exists
 
 if not OPENAI_API_KEY:
-    st.error("❌ Missing OPENAI_API_KEY. Add to `.streamlit/secrets.toml` or Streamlit Cloud → Settings → Secrets.")
-    st.stop()
-# Make sure downstream libs see the key via env
+    st.stop()  # streamlit will render an informative error
+
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
-# Silence Chroma telemetry noise on Streamlit Cloud
-os.environ["ANONYMIZED_TELEMETRY"] = "False"
-os.environ["CHROMA_TELEMETRY_IMPLEMENTATION"] = "none"
-# (optional) reduce Chroma logging
-os.environ["CHROMA_LOG_LEVEL"] = "ERROR"
-
-# ---------- OpenAI client ----------
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# ---------- ElevenLabs preflight ----------
-def eleven_preflight() -> Tuple[bool, str]:
-    if not ELEVEN_API_KEY:
-        return False, "Add ELEVEN_API_KEY in secrets to enable audio."
-    if not ELEVEN_VOICE_ID:
-        return False, "Add ELEVEN_VOICE_ID in secrets to choose a voice."
-    try:
-        r = requests.get("https://api.elevenlabs.io/v1/user",
-                         headers={"xi-api-key": ELEVEN_API_KEY, "Accept": "application/json"},
-                         timeout=20)
-        if r.status_code != 200:
-            return False, f"API key check failed ({r.status_code}): {r.text[:200]}"
-    except Exception as e:
-        return False, f"Could not reach ElevenLabs user endpoint: {e}"
-    try:
-        r = requests.get(f"https://api.elevenlabs.io/v1/voices/{ELEVEN_VOICE_ID}",
-                         headers={"xi-api-key": ELEVEN_API_KEY, "Accept": "application/json"},
-                         timeout=20)
-        if r.status_code == 200:
-            return True, "Audio ready."
-        elif r.status_code in (401, 403):
-            return False, f"Key unauthorized for this voice ({r.status_code}). Verify workspace or share the voice."
-        elif r.status_code == 404:
-            return False, "Voice not found (404). Check ELEVEN_VOICE_ID or share the voice to this account."
-        else:
-            return False, f"Voice check returned {r.status_code}: {r.text[:200]}"
-    except Exception as e:
-        return False, f"Could not reach ElevenLabs voice endpoint: {e}"
-
-# ---------- TTS helpers ----------
-RACHEL_ID = "21m00Tcm4TlvDq8ikWAM"
-
-def _http_tts(voice_id: str, text: str, out_path: str) -> Tuple[bool, str]:
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    headers = {"Accept": "audio/mpeg", "Content-Type": "application/json", "xi-api-key": ELEVEN_API_KEY}
-    payload = {"text": text, "model_id": "eleven_multilingual_v2",
-               "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}
-    try:
-        with requests.post(url, headers=headers, json=payload, stream=True, timeout=60) as r:
-            if r.status_code >= 400:
-                return False, f"{r.status_code} {r.reason}: {r.text[:200]}"
-            with open(out_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-        return True, "ok"
-    except Exception as e:
-        return False, f"request error: {e}"
-
-def synthesize_tts(text: str, out_path: str) -> str:
-    if not ELEVEN_API_KEY or not ELEVEN_VOICE_ID:
-        raise RuntimeError("ElevenLabs audio requires ELEVEN_API_KEY and ELEVEN_VOICE_ID in secrets.")
-
-    MAX_CHARS = 1800
-    speak_text = text if len(text) <= MAX_CHARS else text[:MAX_CHARS] + "…"
-
-    # Try SDK v2 first
-    try:
-        from elevenlabs.client import ElevenLabs
-        el_client = ElevenLabs(api_key=ELEVEN_API_KEY)
-        try:
-            audio = el_client.text_to_speech.convert(
-                voice_id=ELEVEN_VOICE_ID, model_id="eleven_multilingual_v2", text=speak_text
-            )
-            with open(out_path, "wb") as f:
-                if hasattr(audio, "__iter__") and not isinstance(audio, (bytes, bytearray)):
-                    for chunk in audio:
-                        if chunk:
-                            f.write(chunk)
-                else:
-                    f.write(audio)
-            return out_path
-        except Exception as e:
-            if ELEVEN_VERBOSE_ERRORS: st.caption(f"SDK v2 convert failed: {e}")
-    except Exception as e:
-        if ELEVEN_VERBOSE_ERRORS: st.caption(f"SDK v2 import/init failed: {e}")
-
-    # Fallback to raw HTTP; then fallback voice
-    ok, reason = _http_tts(ELEVEN_VOICE_ID, speak_text, out_path)
-    if ok: return out_path
-    ok_fb, reason_fb = _http_tts(RACHEL_ID, speak_text, out_path)
-    if ok_fb:
-        if ELEVEN_VERBOSE_ERRORS: st.caption(f"Fell back to Rachel because primary failed: {reason}")
-        return out_path
-    raise RuntimeError(f"ElevenLabs TTS failed. Primary: {reason}. Fallback: {reason_fb}")
-
-# ---------- LangChain / Chroma ----------
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
-
-# --- Augustine prompt config ---
-AUGUSTINE_SYSTEM_PROMPT = (
-    "You are Augustine of Hippo (354–430). Speak in the FIRST PERSON, "
-    "as a pastor counseling someone in your congregation—warm, candid, concise. "
-    "Derive tone and diction from your own writings (Confessions, City of God, On Christian Doctrine, Enchiridion, Letters, Sermons). "
-    "Answer in AT MOST TWO PARAGRAPHS. Prefer two, but never more. "
-    "Ground your counsel in the retrieved passages. "
-    "SCRIPTURE HANDLING: When you bring in the Bible, NEVER imply you authored it. "
-    "Explicitly attribute it, e.g., 'as Scripture says,' 'as the Apostle writes,' or 'as the Psalmist says.' "
-    "If quoting, keep it brief and put the reference in parentheses, e.g., (Rom 5:5) or (Ps 139). "
-    "Do not place Augustine’s words in quotation marks as if they were Scripture, and do not say 'I wrote' about Scripture.\n\n"
-    "PARENTHESES: You may include brief citations in parentheses; the app will not speak parentheses aloud."
-)
-
-# --- Persisted Chroma config (LOCKED to ingest path) ---
-DB_DIR = Path("chroma_db/augustine")   # MUST match ingest.py
-COLLECTION = "augustine"
-RETRIEVAL_K = 5
-
-@st.cache_resource(show_spinner=True)
+# ---------- Vector DB ----------
+@st.cache_resource(show_spinner=False)
 def load_vectordb():
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    emb = OpenAIEmbeddings(model="text-embedding-3-large")
+    embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
     return Chroma(
-        persist_directory=str(DB_DIR),
-        collection_name=COLLECTION,
-        embedding_function=emb,
+        embedding_function=embeddings,
+        persist_directory=PERSIST_DIR,
+        collection_name=COLLECTION_NAME,
     )
 
-def index_count(vdb) -> int | None:
+def collection_count(vs: Chroma) -> int:
     try:
-        return vdb._collection.count()
+        return vs._collection.count()  # pyright: ignore
     except Exception:
-        return None
+        return 0
 
-# ---------- Robust source formatting ----------
-def _best_meta_title(meta: dict, fallback: str = "unknown") -> str:
-    return (
-        meta.get("work_title")
-        or meta.get("title")
-        or meta.get("source")
-        or meta.get("source_path")
-        or meta.get("file_path")
-        or meta.get("path")
-        or meta.get("filename")
-        or fallback
-    )
+# ---------- UI ----------
+st.set_page_config(page_title="Ask St. Augustine Anything", layout="wide")
 
-def _best_meta_page(meta: dict):
-    return meta.get("page") or meta.get("page_number") or meta.get("page_no") or "chunk"
+st.sidebar.header("Dataset")
+st.sidebar.write(f"**Index path:** `{PERSIST_DIR}`")
 
-def build_context(hits) -> str:
-    """Accepts list[(Document, score)] or list[Document]; formats for prompting."""
-    blocks = []
-    for h in hits:
-        if isinstance(h, tuple):
-            doc, score = h
-        else:
-            doc, score = h, None
-        meta = doc.metadata or {}
-        title = _best_meta_title(meta, fallback=Path(meta.get("source_path", "unknown")).stem)
-        page = _best_meta_page(meta)
-        header = f"[SOURCE] ({title} — {page})"
-        if score is not None:
-            try:
-                header += f"  [score: {score:.3f}]"
-            except Exception:
-                pass
-        text = (doc.page_content or "").strip()
-        blocks.append(f"{header}\n{text}")
-    return "\n\n".join(blocks)
+# Show file list found under data/clean_final
+txts = sorted([str(p) for p in DATA_DIR.rglob("*.txt")])
+st.sidebar.write(f"**Found {len(txts)} .txt files under** `data/clean_final`.")
+with st.sidebar.expander("Examples:", expanded=False):
+    st.code(txts[:10] if txts else "[]", language="json")
 
-def strip_parentheses(text: str) -> str:
-    return re.sub(r"\s*\([^)]*\)", "", text)
-
-def limit_to_two_paragraphs(text: str) -> str:
-    paras = [p.strip() for p in text.split("\n") if p.strip()]
-    return "\n\n".join(paras[:2])
-
-# ---------- Streamlit UI ----------
-st.set_page_config(page_title="Talk to Augustine (Audio-First)", page_icon="📜")
-st.markdown(
-    """
-    <style>
-      .block-container { max-width: 900px !important; }
-      .audio-wrap { margin: 0.4rem 0 1rem 0; }
-      .caption-box { font-size: 0.95rem; line-height: 1.6; color: #444; opacity: 0.9; }
-      .stExpander { border: 1px solid #e6e6e6; border-radius: 10px; }
-      .stExpander > div[role='button'] { font-weight: 600; }
-      .stChatMessage { line-height: 1.55; }
-      code, pre { font-size: 0.95em; }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
-st.title("Ask St. Augustine Anything")
-st.caption("Answers are drawn exclusively from his writings")
-st.divider()
-
-# Chat history
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-# persist last hits for showing Sources even across reruns
-if "last_hits" not in st.session_state:
-    st.session_state.last_hits = []
-
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-with st.spinner("Loading knowledge base…"):
-    vectordb = load_vectordb()
-
-# ---------- Sidebar ----------
+# Rebuild button
 with st.sidebar:
-    st.subheader("Dataset")
-
-    # Show where we're loading from and how many chunks are in the index
-    st.caption(f"📂 Index path: `{DB_DIR}`")
-    st.caption(f"🧩 Chunks in index: **{index_count(vectordb)}**")
-
-    st.write("Chroma index loaded from `chroma_db/augustine`.")
-    st.caption("Source files (cleaned) live under `data/clean_final`. Use the button below to rebuild the index.")
-
-        # Debug: check if Streamlit sees the .txt files
-    try:
-        from itertools import islice
-        txts = list(islice(Path("data/clean_final").rglob("*.txt"), 5))
-        total_txts = len(list(Path("data/clean_final").rglob("*.txt")))
-        st.caption(f"🗂️ Found {total_txts} .txt files under data/clean_final")
-        if txts:
-            st.write("Examples:", [str(p) for p in txts])
-    except Exception as e:
-        st.warning(f"Could not list data/clean_final: {e}")
-
-# Rebuild index (txt-only ingest) and FORCE reload of the cached DB
-try:
-    from ingest import rebuild_vectorstore
-    if st.button("🔁 Rebuild index from data/clean_final", key="rebuild_btn"):
-        os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # secrets → env for ingest.py
+    if st.button("Rebuild index from data/clean_final", type="primary"):
         with st.spinner("Rebuilding vector store…"):
+            from ingest import rebuild_vectorstore
             try:
                 chunk_count = rebuild_vectorstore()
+                st.success(f"Done. Chunks in index: {chunk_count}")
             except Exception as e:
                 st.error(f"Ingest failed: {e}")
-                chunk_count = 0
+        # clear cache so the next call reloads the DB
         load_vectordb.clear()
-        vectordb = load_vectordb()
-        st.success(f"Done. Chunks in index: {chunk_count}")
-except Exception as e:
-    st.caption(f"`ingest.py` not found, rebuild button disabled. ({e})")
 
+# Load DB
+vectordb = load_vectordb()
+st.sidebar.write(f"**Chunks in index:** {collection_count(vectordb)}")
+st.sidebar.write(f"**Chroma index loaded from** `{PERSIST_DIR}`.")
 
-    # Debug tester
-    test_q = st.text_input("🔎 Test query (debug)", value="grace and will", key="test_query_input")
-    if st.button("Run test retrieval", key="test_retrieval_btn"):
-        try:
-            test_hits = vectordb.similarity_search_with_relevance_scores(test_q, k=3)
-            st.session_state.last_hits = test_hits  # main expander will show them
-            st.success(f"Retrieved {len(test_hits)} chunk(s). See Sources expander.")
-            st.write("Raw metadata:")
-            st.json([ (h[0].metadata if isinstance(h, tuple) else h.metadata) for h in test_hits ])
-        except Exception as e:
-            st.error(f"Test retrieval error: {e}")
+# ---------- RAG Chain ----------
+SYSTEM_PROMPT = """You are St. Augustine scholar-bot. Answer strictly from the retrieved context.
+If unsure, say you don't know. Always cite sources with their file path and chunk number.
+"""
 
-    st.subheader("Audio")
-    ok, reason = eleven_preflight()
-    if ok:
-        audio_enabled    = st.toggle("🔊 Speak answers (default ON)", value=True, key="audio_enabled_toggle")
-        autoplay_enabled = st.toggle("▶️ Auto-play audio (default ON)", value=True, key="autoplay_enabled_toggle")
+qa_prompt = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        SYSTEM_PROMPT
+        + "\nContext:\n{context}\n\nQuestion: {question}\n\nAnswer:"
+    ),
+)
+
+llm = ChatOpenAI(model=CHAT_MODEL, temperature=0)
+
+retriever = vectordb.as_retriever(search_kwargs={"k": 4})
+
+qa = RetrievalQA.from_chain_type(
+    llm=llm,
+    chain_type="stuff",
+    retriever=retriever,
+    chain_type_kwargs={"prompt": qa_prompt},
+    return_source_documents=True,
+)
+
+# ---------- Page ----------
+st.title("Ask St. Augustine Anything")
+st.caption("Answers are drawn exclusively from his writings")
+
+q = st.text_input("Ask:", value="Teach me about grace", help="The bot cites exact files/chunks")
+ask = st.button("Ask")
+
+def render_sources(src_docs: List):
+    if not src_docs:
+        st.info("No sources returned.")
+        return
+    st.subheader("Sources")
+    for i, d in enumerate(src_docs, 1):
+        meta = d.metadata or {}
+        source = meta.get("source", "unknown")
+        # attach a 'chunk' index if present
+        chunk_id = meta.get("chunk", "")
+        label = f"{source}" + (f" — chunk {chunk_id}" if chunk_id != "" else "")
+        with st.expander(f"{i}. {label}", expanded=False):
+            st.write(d.page_content[:1200] + ("..." if len(d.page_content) > 1200 else ""))
+
+if ask:
+    if collection_count(vectordb) == 0:
+        st.error("Index is empty (0 chunks). Click **Rebuild index** in the sidebar.")
     else:
-        audio_enabled = False
-        autoplay_enabled = False
-        st.info(reason)
-
-# ---------- Helper: inline autoplay audio ----------
-def render_autoplay_audio(file_path: str, autoplay: bool = True):
-    with open(file_path, "rb") as f:
-        audio_bytes = f.read()
-    b64 = base64.b64encode(audio_bytes).decode()
-    auto_attr = "autoplay" if autoplay else ""
-    st.markdown(
-        f"""
-        <div class="audio-wrap">
-          <audio {auto_attr} controls src="data:audio/mpeg;base64,{b64}"></audio>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-# ---------- Chat (Option A retrieval wired in) ----------
-user_q = st.chat_input("Ask your question…")
-if user_q:
-    if not isinstance(user_q, str) or not user_q.strip():
-        st.warning("Empty question; please type something.")
-        st.stop()
-
-    st.session_state.messages.append({"role": "user", "content": user_q})
-    with st.chat_message("user"):
-        st.markdown(user_q)
-
-    ans = ""
-    transcript_text = ""
-    spoken_text = ""
-
-    with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
-            try:
-                # OPTION A: simple top-k search (returns list of (Document, score))
-                hits = vectordb.similarity_search_with_relevance_scores(
-                    user_q, k=RETRIEVAL_K
-                )
-                st.session_state.last_hits = hits  # persist for the Sources section
-                context = build_context(hits)
+            out = qa({"query": q})
+        st.markdown("### Answer")
+        st.write(out["result"])
+        render_sources(out.get("source_documents", []))
 
-                messages = [
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "system", "content": AUGUSTINE_SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"{user_q}\n\n"
-                            "Context (top passages from Augustine's works):\n"
-                            f"{context if context.strip() else '(no strong matches)'}\n\n"
-                            "Reminder: Attribute Bible verses as Scripture (e.g., 'as Scripture says …'), "
-                            "and never as something you authored. Keep the answer to at most two short paragraphs."
-                        ),
-                    },
-                ]
-
-                resp = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=messages,
-                    temperature=0.3,
-                )
-                ans = (resp.choices[0].message.content or "").strip()
-
-                # --- POST-PROCESSING FOR AUDIO-FIRST UI ---
-                transcript_text = limit_to_two_paragraphs(ans)
-                spoken_text = strip_parentheses(transcript_text)
-
-            except Exception as e:
-                ans = f"Sorry, I hit an error: `{e}`"
-                st.session_state.last_hits = []  # make it explicit on failure
-
-            # 1) AUDIO FIRST
-            if audio_enabled and ELEVEN_API_KEY and ans.strip():
-                try:
-                    out_dir = Path("audio"); out_dir.mkdir(exist_ok=True)
-                    audio_path = out_dir / f"reply_{len(st.session_state.messages)}.mp3"
-                    synthesize_tts(spoken_text or ans, str(audio_path))
-                    render_autoplay_audio(str(audio_path), autoplay=bool(autoplay_enabled))
-                except Exception as e:
-                    st.warning(f"Audio generation failed: {e}")
-
-            # 2) CAPTIONS
-            with st.expander("📝 Transcript (click to show/hide)", expanded=False):
-                st.markdown(
-                    f"<div class='caption-box'>{(transcript_text or ans)}</div>",
-                    unsafe_allow_html=True
-                )
-
-# ---------- ALWAYS render Sources + Debug (persists across reruns) ----------
-with st.expander("Sources (click to expand)", expanded=False):
-    hits_to_show = st.session_state.get("last_hits", [])
-    if not hits_to_show:
-        st.caption("No sources retrieved. (Index empty or no strong matches.)")
-        st.caption("Tip: click “🔁 Rebuild index” in the sidebar if you haven’t ingested yet.")
-    else:
-        for i, h in enumerate(hits_to_show, 1):
-            if isinstance(h, tuple):
-                d, sc = h
-            else:
-                d, sc = h, None
-            meta = d.metadata or {}
-            work = _best_meta_title(meta, fallback=Path(meta.get("source_path","unknown")).stem)
-            page = _best_meta_page(meta)
-            line = f"**{i}. {work}** — {page}"
-            if sc is not None:
-                try:
-                    line += f"  _(score: {sc:.3f})_"
-                except Exception:
-                    pass
-            st.markdown(line)
-
-            excerpt = (d.page_content or "").strip().replace("\n", " ")
-            if excerpt:
-                st.caption(excerpt[:350] + ("…" if len(excerpt) > 350 else ""))
-
-with st.expander("🔧 Debug: raw metadata"):
-    try:
-        meta_list = [ (h[0].metadata if isinstance(h, tuple) else h.metadata)
-                      for h in st.session_state.get("last_hits", []) ]
-        st.json(meta_list)
-    except Exception:
-        st.caption("Could not display raw metadata.")
-
-# Finally, if we generated an answer this run, store it in history
-if user_q:
-    st.session_state.messages.append({"role": "assistant", "content": (transcript_text or ans)})
+# ---------- Optional: Audio (safe-guarded) ----------
+# Only reference audio_enabled after it is defined above
+if audio_enabled:
+    st.sidebar.success("ElevenLabs audio enabled.")
+else:
+    st.sidebar.info("ElevenLabs audio disabled (no API key).")
